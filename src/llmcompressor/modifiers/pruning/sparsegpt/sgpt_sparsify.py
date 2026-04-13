@@ -58,7 +58,7 @@ def accumulate_hessian(
 
 def sparsify_weight(
     module: torch.nn.Module,
-    hessians_dict: Dict[torch.nn.Module, torch.Tensor],
+    hessians: torch.Tensor,
     sparsity: float,
     prune_n: int,
     prune_m: int,
@@ -82,8 +82,7 @@ def sparsify_weight(
     final_shape = module.weight.shape
     final_dtype = module.weight.dtype
     W = module.weight.clone()
-    H = hessians_dict[module]  # unfortunately python does not have a `move` keyword
-    del hessians_dict[module]  # so we have to delete the original reference manually
+    H = hessians
 
     # standardize shape and dtype
     if isinstance(module, torch.nn.Conv2d):
