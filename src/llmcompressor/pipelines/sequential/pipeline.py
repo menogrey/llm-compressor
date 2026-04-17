@@ -8,7 +8,7 @@ from tqdm import tqdm
 
 from llmcompressor.core import LifecycleCallbacks, active_session
 from llmcompressor.modifiers.utils.hooks import HooksMixin
-from llmcompressor.pipelines.cache import IntermediatesCache, maybe_prefetch
+from llmcompressor.pipelines.cache import IntermediatesCache
 from llmcompressor.pipelines.registry import CalibrationPipeline
 from llmcompressor.pipelines.sequential.helpers import (
     dispatch_for_sequential,
@@ -30,17 +30,22 @@ __all__ = ["SequentialPipeline"]
 
 
 def _get_batches(
-    activations: list[IntermediatesCache],
+    activations: IntermediatesCache,
     num_batches: int,
     input_names: list[str],
     desc: str,
+    sequential_prefetch: bool = False,
 ) -> Iterator[tuple[int, dict]]:
     """
     Yield (batch_idx, inputs) with the next batch optionally prefetched in a
     background thread to overlap fetch (onload from offload device) with the
     main-thread forward pass.
     """
-    batch_source = maybe_prefetch(activations)
+    batch_source = (
+        activations.iter_prefetch()
+        if sequential_prefetch
+        else activations.iter()
+    )
     filtered = (
         {k: v for k, v in item.items() if k in input_names} for item in batch_source
     )
@@ -127,7 +132,7 @@ class SequentialPipeline(CalibrationPipeline):
             use_loss_mask = getattr(dataset_args, "use_loss_mask", False)
             if use_loss_mask:
                 session.state.loss_masks = [
-                    activations[batch_idx].fetch().get("loss_mask")
+                    activations[batch_idx]["loss_mask"].fetch()
                     for batch_idx in range(len(dataloader))
                 ]
             else:
@@ -150,6 +155,7 @@ class SequentialPipeline(CalibrationPipeline):
                         num_batches,
                         subgraph.input_names,
                         calib_desc,
+                        sequential_prefetch,
                     ):
                         session.state.current_batch_idx = batch_idx
                         subgraph.forward(model, **inputs)
@@ -164,17 +170,16 @@ class SequentialPipeline(CalibrationPipeline):
                             num_batches,
                             subgraph.input_names,
                             prop_desc,
+                            sequential_prefetch,
                         ):
                             output = subgraph.forward(model, **inputs)
                             if subgraph_index < num_subgraphs - 1:
-                                new_activation = activations[batch_idx].fetch()
-                                new_activation.update(output)
-                                new_activation = {
-                                    k: v
-                                    for k, v in new_activation.items()
-                                    if k not in subgraph.consumed_names
-                                }
-                                activations[batch_idx].update(new_activation)
+                                update = activations[batch_idx].intermediate
+                                update.update(output)
+                                activations[batch_idx].update(update)
+                                for name in subgraph.consumed_names:
+                                    if name in activations[batch_idx].intermediate:
+                                        del activations[batch_idx][name]
 
             # redundant, finish any remaining compression
             LifecycleCallbacks.calibration_epoch_end()

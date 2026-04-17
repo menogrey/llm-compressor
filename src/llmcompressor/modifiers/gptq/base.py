@@ -125,7 +125,7 @@ class GPTQModifier(Modifier, QuantizationMixin):
 
     # private variables
     _module_names: Dict[torch.nn.Module, str] = PrivateAttr(default_factory=dict)
-    _hessians: Dict[torch.nn.Module, IntermediatesCache] = PrivateAttr(default_factory=dict)
+    _hessians: Dict[torch.nn.Module, IntermediatesCache[torch.Tensor]] = PrivateAttr(default_factory=dict)
     _num_samples: Dict[torch.nn.Module, torch.Tensor] = PrivateAttr(
         default_factory=dict
     )
@@ -286,7 +286,7 @@ class GPTQModifier(Modifier, QuantizationMixin):
         module_list, rank_to_modules, module_to_rank = greedy_bin_packing(
             list(self._hessians.keys()),
             world_size,
-            item_weight_fn=lambda mod: self._hessians[mod].value.shape[0],
+            item_weight_fn=lambda mod: self._hessians[mod].intermediate.shape[0],
         )
 
         # send hessians to assigned ranks

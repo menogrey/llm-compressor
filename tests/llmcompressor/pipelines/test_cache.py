@@ -7,7 +7,6 @@ from torch.utils.data import DataLoader, StackDataset
 from llmcompressor.pipelines.cache import (
     IntermediatesCache,
     OverrideEqMode,
-    maybe_prefetch,
 )
 
 
@@ -52,9 +51,9 @@ def test_initialization(sample_dataloader):
         model_device=torch.device("cpu"),
     )
 
-    assert isinstance(cache[0], IntermediatesCache)
+    assert isinstance(cache, IntermediatesCache)
     assert len(cache) > 0
-    assert isinstance(cache[0].intermediate.value, dict)
+    assert isinstance(cache.intermediate[0].intermediate, dict)
 
 
 @pytest.mark.unit
@@ -66,8 +65,8 @@ def test_iter_prefetch_matches_iter(sample_cache):
             return False
         return all(deep_equal(a[k], b[k]) for k in a)
 
-    via_iter = [cache.fetch() for cache in sample_cache]
-    via_prefetch = list(maybe_prefetch(sample_cache))
+    via_iter = list(sample_cache.iter())
+    via_prefetch = list(sample_cache.iter_prefetch())
     assert len(via_iter) == len(via_prefetch)
     for i, (b_iter, b_prefetch) in enumerate(zip(via_iter, via_prefetch)):
         assert batch_dicts_equal(b_iter, b_prefetch), f"batch {i} differs"
@@ -75,7 +74,7 @@ def test_iter_prefetch_matches_iter(sample_cache):
 
 @pytest.mark.unit
 def test_fetch_inputs(sample_cache):
-    fetched = sample_cache[0].fetch()
+    fetched = sample_cache.fetch()[0]
 
     assert isinstance(fetched, dict)
     assert "input_ids" in fetched
@@ -91,18 +90,11 @@ def test_update_intermediates(sample_cache):
         "logits": torch.randn(2, 4, 1000),
     }
 
-    sample_cache[0].update(new_outputs)
+    sample_cache.update(new_outputs)
 
     # Verify the updates were stored
-    assert "hidden_states" in sample_cache[0].intermediate.value
-    assert "logits" in sample_cache[0].intermediate.value
-
-
-@pytest.mark.unit
-def test_delete_intermediates(sample_cache):
-    sample_cache[0].delete()
-
-    assert sample_cache[0].intermediate is None
+    assert "hidden_states" in sample_cache.intermediate
+    assert "logits" in sample_cache.intermediate
 
 
 @pytest.mark.unit
@@ -110,9 +102,9 @@ def test_delete_intermediates(sample_cache):
 def test_from_dataloader(value):
     dataset = StackDataset(value=[value])
     dataloader = DataLoader(dataset, batch_size=1, collate_fn=lambda x: x[0])
-    caches = IntermediatesCache.from_dataloader(dataloader)
+    cache = IntermediatesCache.from_dataloader(dataloader)
 
-    onloaded = caches[0].fetch()["value"]
+    onloaded = cache.fetch()[0]["value"]
     assert deep_equal(onloaded, value)
 
 
@@ -141,13 +133,15 @@ def test_device_handling(sample_dataloader):
 
     # Add some GPU tensors
     new_outputs = {"hidden_states": torch.randn(2, 3).to(cuda_device)}
-    cache[0].update(new_outputs)
+    cache.update(new_outputs)
 
     # Verify tensors are offloaded to CPU
-    assert cache[0].intermediate.value["hidden_states"].value.device.type == "cpu"
+    assert isinstance(cache.intermediate["hidden_states"], IntermediatesCache)
+    assert cache.intermediate["hidden_states"].intermediate.device.type == "cpu"
 
     # Verify tensors are loaded back to GPU when fetched
-    fetched = cache[0].fetch()
+    fetched = cache.fetch()
+    assert isinstance(fetched["hidden_states"], torch.Tensor)
     assert fetched["hidden_states"].device.type == "cuda"
 
 

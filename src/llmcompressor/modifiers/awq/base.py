@@ -45,7 +45,7 @@ from llmcompressor.modifiers.utils import update_fused_layer_weight_global_scale
 from llmcompressor.modifiers.utils.hooks import HooksMixin
 from llmcompressor.modifiers.utils.pytorch_helpers import is_moe_model
 from llmcompressor.observers.base import Observer
-from llmcompressor.pipelines.cache import IntermediatesCache, maybe_prefetch
+from llmcompressor.pipelines.cache import IntermediatesCache
 from llmcompressor.sentinel import Sentinel
 from llmcompressor.utils import get_high_precision
 from llmcompressor.utils.helpers import calibration_forward_context
@@ -163,11 +163,11 @@ class AWQModifier(Modifier, QuantizationMixin):
     # Private vars set during initialization, cleared during finalization
     _resolved_mappings: list[ResolvedMapping] = PrivateAttr(default_factory=list)
     # Cache list of forward input args for each parent module, one dict for each batch
-    _parent_args_cache: dict[Module, list[IntermediatesCache]] = PrivateAttr(
+    _parent_args_cache: dict[Module, IntermediatesCache[list[dict[str, torch.Tensor]]]] = PrivateAttr(
         default_factory=dict
     )
     # Dict[smooth layer name, [activation sums, activation counts]]
-    _smooth_activation_stats: dict[str, IntermediatesCache] = PrivateAttr(
+    _smooth_activation_stats: dict[str, IntermediatesCache[list[torch.Tensor]]] = PrivateAttr(
         default_factory=dict
     )
     # List to store error metrics for each layer
@@ -437,10 +437,9 @@ class AWQModifier(Modifier, QuantizationMixin):
             for k, v in values.arguments.items():
                 if isinstance(v, QuantizedKVCache):
                     values.arguments[k] = None
-
-            cache = IntermediatesCache.empty(self.offload_device)
-            cache.update(values.arguments)
-            self._parent_args_cache[module].append(cache)
+            if self._parent_args_cache[module].intermediate is None:
+                self._parent_args_cache[module].update([])
+            self._parent_args_cache[module].append(values.arguments)
 
         def create_cache_smooth_activations_hook_fn(smooth_name):
             def cache_smooth_activations_hook(
@@ -475,22 +474,21 @@ class AWQModifier(Modifier, QuantizationMixin):
                     self._smooth_activation_stats[smooth_name] = IntermediatesCache.empty(
                         self.offload_device,
                     )
-                    self._smooth_activation_stats[smooth_name].update((
+                    self._smooth_activation_stats[smooth_name].update([
                         torch.zeros_like(new_sum),
                         torch.zeros_like(new_count),
-                    ))
+                    ])
                 sum, count = self._smooth_activation_stats[smooth_name].fetch()
                 sum += new_sum
                 count += new_count
-                self._smooth_activation_stats[smooth_name].update((sum, count))
-
+                self._smooth_activation_stats[smooth_name].update([sum, count])
             return cache_smooth_activations_hook
 
         for mapping in self._resolved_mappings:
             # parent kwargs needed for future forward passes
             # same parent may appear multiple times in resolved mappings
             if mapping.parent not in self._parent_args_cache:
-                self._parent_args_cache[mapping.parent] = []
+                self._parent_args_cache[mapping.parent] = IntermediatesCache.empty(self.offload_device)
                 self.register_hook(
                     mapping.parent,
                     cache_parent_kwargs_hook,
@@ -623,8 +621,9 @@ class AWQModifier(Modifier, QuantizationMixin):
 
     @torch.no_grad()
     def _run_samples(self, module: Module) -> list[torch.Tensor]:
-        caches = self._parent_args_cache[module]
-        batch_iter = maybe_prefetch(caches)
+        cache = self._parent_args_cache[module]
+        use_prefetch = active_session().state.sequential_prefetch
+        batch_iter = cache.iter_prefetch() if use_prefetch else cache.iter()
         outputs = [module(**batch_kwargs) for batch_kwargs in batch_iter]
         return [
             # If tuple, assume that first argument is the input

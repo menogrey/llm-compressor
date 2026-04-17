@@ -80,7 +80,7 @@ class SparseGPTModifier(SparsityModifierBase):
 
     # private variables
     _num_samples: dict[torch.nn.Module, int] = PrivateAttr(default_factory=dict)
-    _hessians: dict[torch.nn.Module, IntermediatesCache] = PrivateAttr(default_factory=dict)
+    _hessians: dict[torch.nn.Module, IntermediatesCache[torch.Tensor]] = PrivateAttr(default_factory=dict)
 
     def calibrate_module(
         self,
