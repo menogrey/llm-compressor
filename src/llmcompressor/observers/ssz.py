@@ -9,7 +9,8 @@ from compressed_tensors.quantization.lifecycle import fake_quantize, quantize
 from compressed_tensors.quantization.utils import calculate_qparams, generate_gparam
 from compressed_tensors.utils import patch_attr
 
-from llmcompressor.observers.base import MinMaxTuple, Observer
+from llmcompressor.observers.base import MinMaxTuple, ScaleZpTuple, Observer
+from llmcompressor.observers.helpers import flatten_for_calibration
 from llmcompressor.observers.moving_base import MovingAverageObserverBase
 
 __all__ = ["SSZObserver"]
@@ -32,11 +33,12 @@ class SSZObserver(Observer):
         self.iter_num = observer_kwargs.get("iter_num", 50)
         self.threshold = observer_kwargs.get("threshold", 1e-10)
         self.min_scale = observer_kwargs.get("min_scale", 1e-30)
-    
-    def get_min_max(self, observed: torch.Tensor) -> MinMaxTuple:
+
+    @torch.no_grad
+    def forward(self, observed: torch.Tensor) -> ScaleZpTuple:
         global_scale = self._get_module_param("global_scale")
         return _ssz_calculate(
-            observed.T,
+            observed,
             self.args,
             self.iter_num,
             self.threshold,
@@ -44,17 +46,53 @@ class SSZObserver(Observer):
             global_scale=global_scale,
         )
     
+    @torch.no_grad
+    def get_global_scale(self, observed: torch.Tensor) -> torch.Tensor:
+        # observed = observed.reshape((1, 1, -1))  # per tensor reshape
+
+        # global_min_vals, global_max_vals = self.get_global_min_max(observed)
+        # global_scale = generate_gparam(global_min_vals, global_max_vals)
+
+        # return global_scale, global_min_vals, global_max_vals
+
+        raise NotImplementedError("Global scale optimization not implemented for SSZ observer yet.")
+
+    def get_min_max(self, observed: torch.Tensor) -> MinMaxTuple:
+        min_vals = torch.amin(observed, dim=(0, -1))
+        max_vals = torch.amax(observed, dim=(0, -1))
+        return (min_vals, max_vals)
 
     def get_global_min_max(self, observed: torch.Tensor) -> MinMaxTuple:
-        return _ssz_calculate(
-            observed.T,
-            self.args,
-            self.iter_num,
-            self.threshold,
-            self.min_scale,
-            global_scale=None,
-        )
+        min_vals = torch.amin(observed, dim=(0, -1))
+        max_vals = torch.amax(observed, dim=(0, -1))
+        return (min_vals, max_vals)
     
+
+def _get_reduce_dims(
+    observed: torch.Tensor, 
+    args: QuantizationArgs
+) -> tuple[int, ...]:
+    """
+    Get dimensions to reduce for MSE/scale/zero_point calculations.
+    
+    Returns tuple of dimensions to reduce over, based on quantization strategy.
+    """
+    if args.strategy == QuantizationStrategy.TENSOR:
+        # Reduce all dimensions -> scalar
+        return tuple(range(observed.ndim))
+    
+    if args.strategy == QuantizationStrategy.CHANNEL:
+        # Reduce all dimensions except the channel axis
+        return tuple(d for d in range(observed.ndim) if d != 0)
+    
+    if args.strategy in (QuantizationStrategy.GROUP, QuantizationStrategy.TENSOR_GROUP):
+        # For GROUP: observed shape is (1, num_rows, num_groups, group_size)
+        # Reduce everything except the group dimension (dim=2)
+        return tuple(d for d in range(observed.ndim) if d != 2)
+    
+    # Fallback: reduce all
+    return tuple(range(observed.ndim))
+
 
 def _ssz_calculate(
     observed: torch.Tensor,
@@ -63,7 +101,7 @@ def _ssz_calculate(
     threshold: float,
     min_scale: float,
     global_scale: Optional[torch.Tensor] = None,
-) -> MinMaxTuple:
+) -> ScaleZpTuple:
     """
     Compute quantization parameters using SSZ (Scan-Scale-Zero) algorithm.
 
@@ -76,7 +114,7 @@ def _ssz_calculate(
         global_scale: Optional precomputed global scale to use during optimization.
 
     Returns:
-        Tuple of (min_vals, max_vals) representing the optimized quantization range.
+        Tuple of (scales, zero_points) representing the optimized quantization parameters.
     """
     min_vals = torch.amin(observed, dim=(0, -1))
     max_vals = torch.amax(observed, dim=(0, -1))
@@ -101,14 +139,16 @@ def _ssz_calculate(
         global_scale=global_scale if args.strategy == "tensor_group" else None,
     )
 
-    best_mse = torch.mean(torch.pow(torch.abs((observed - best_dequant_weight)), 2), dim=0, keepdim=True)
+    reduced_dims = _get_reduce_dims(observed, args)
+
+    best_mse = torch.mean(torch.pow(torch.abs((observed - best_dequant_weight)), 2), dim=reduced_dims, keepdim=True)
 
     quant_weight = best_quant_weight
 
     for i in range(iter_num):
         if args.symmetric:
-            current_scale = (torch.sum(observed * quant_weight, dim=0, keepdim=True) /
-                             torch.sum(quant_weight * quant_weight, dim=0, keepdim=True)
+            current_scale = (torch.sum(observed * quant_weight, dim=reduced_dims, keepdim=True) /
+                             torch.sum(quant_weight * quant_weight, dim=reduced_dims, keepdim=True)
                              .clamp(min=min_scale))
             current_zero_point = best_zero_point
             quant_weight = quantize(
@@ -121,11 +161,11 @@ def _ssz_calculate(
             
         else:
             quant_weight_zero_point = quant_weight - best_zero_point
-            current_scale = (torch.sum(observed * quant_weight_zero_point, dim=0, keepdim=True) /
-                             torch.sum(quant_weight_zero_point * quant_weight_zero_point, dim=0, keepdim=True)
+            current_scale = (torch.sum(observed * quant_weight_zero_point, dim=reduced_dims, keepdim=True) /
+                             torch.sum(quant_weight_zero_point * quant_weight_zero_point, dim=reduced_dims, keepdim=True)
                              .clamp(min=min_scale))
             
-            current_zero_point = (torch.sum(quant_weight_zero_point * current_scale - observed, dim=0, keepdim=True) /
+            current_zero_point = (torch.sum(quant_weight_zero_point * current_scale - observed, dim=reduced_dims, keepdim=True) /
                                     (observed.shape[0] * current_scale))
             quant_weight = quantize(
                 observed,
@@ -144,7 +184,7 @@ def _ssz_calculate(
         )
 
         current_mse = torch.mean(torch.pow(torch.abs((observed - current_dequant_weight)), 2),
-                                 dim=0, keepdim=True).squeeze()
+                                 dim=reduced_dims, keepdim=True)
 
         mask1 = (best_mse - current_mse) / best_mse.clamp(min=1e-4) < threshold
         mask2 = torch.abs(best_mse - current_mse) < threshold
@@ -154,12 +194,12 @@ def _ssz_calculate(
 
         mask = (current_mse < best_mse).to(torch.int32)
         best_mse = best_mse * (1 - mask) + current_mse * mask
-        best_scale = (best_scale * (1 - mask) + current_scale * mask).squeeze()
+        best_scale = (best_scale * (1 - mask) + current_scale * mask)
 
         if args.symmetric:
             best_zero_point = current_zero_point
         else:
-            best_zero_point = (best_zero_point * (1 - mask) + current_zero_point * mask).squeeze()
+            best_zero_point = (best_zero_point * (1 - mask) + current_zero_point * mask)
 
         best_quant_weight = best_quant_weight * (1 - mask) + quant_weight * mask
     return best_scale, best_zero_point

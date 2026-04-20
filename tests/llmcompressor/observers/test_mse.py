@@ -35,7 +35,10 @@ def test_mse_observer(strategy, symmetric, exp_loss):
     observer = Observer.load_from_registry(observer, base_name="weight", args=weights)
     assert isinstance(observer, MovingAverageMSEObserver)
 
+    torch.set_printoptions(precision=16)
+
     scale, zero_point = observer(tensor)
+    print(scale, zero_point)
     q_tensor = fake_quantize(tensor, scale, zero_point, weights)
     mse_loss = torch.sum((tensor - q_tensor).abs_().pow_(2)) / tensor.numel()
     assert mse_loss == pytest.approx(exp_loss, abs=1e-10)
