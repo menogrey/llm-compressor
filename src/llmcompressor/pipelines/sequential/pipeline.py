@@ -36,21 +36,9 @@ def _get_batches(
     desc: str,
     sequential_prefetch: bool = False,
 ) -> Iterator[tuple[int, dict]]:
-    """
-    Yield (batch_idx, inputs) with the next batch optionally prefetched in a
-    background thread to overlap fetch (onload from offload device) with the
-    main-thread forward pass. Delegates to
-    :meth:`IntermediatesCache.iter_prefetch` when prefetching is enabled.
-    """
-    batch_source = (
-        activations.iter_prefetch(input_names)
-        if sequential_prefetch
-        else activations.iter(input_names)
-    )
-    for batch_idx, inputs in tqdm(
-        enumerate(batch_source), total=num_batches, desc=desc
-    ):
-        yield batch_idx, inputs
+    batch_iter = activations.iter_prefetch() if sequential_prefetch else activations.iter()
+    for batch_idx, batch_proxy in tqdm(enumerate(batch_iter), total=num_batches, desc=desc):
+        yield batch_idx, batch_proxy.select(input_names)
 
 
 @CalibrationPipeline.register("sequential")
@@ -132,7 +120,7 @@ class SequentialPipeline(CalibrationPipeline):
             use_loss_mask = getattr(dataset_args, "use_loss_mask", False)
             if use_loss_mask:
                 session.state.loss_masks = [
-                    activations.fetch(batch_idx, ["loss_mask"]).get("loss_mask")
+                    activations[batch_idx]["loss_mask"].unwrap()
                     for batch_idx in range(len(dataloader))
                 ]
             else:
@@ -174,8 +162,11 @@ class SequentialPipeline(CalibrationPipeline):
                         ):
                             output = subgraph.forward(model, **inputs)
                             if subgraph_index < num_subgraphs - 1:
-                                activations.update(batch_idx, output)
-                                activations.delete(batch_idx, subgraph.consumed_names)
+                                batch_dict = activations._data[batch_idx]
+                                batch_dict.update(IntermediatesCache._offload_value(output, activations._offload_device, activations._onload_device))
+                                for name in subgraph.consumed_names:
+                                    if name in batch_dict:
+                                        del batch_dict[name]
 
             # redundant, finish any remaining compression
             LifecycleCallbacks.calibration_epoch_end()

@@ -474,7 +474,7 @@ class AWQModifier(Modifier):
             # same parent may appear multiple times in resolved mappings
             if mapping.parent not in self._parent_args_cache:
                 self._parent_args_cache[mapping.parent] = IntermediatesCache(
-                    None,
+                    [],
                     self.offload_device,
                 )
                 self.register_hook(
@@ -604,20 +604,19 @@ class AWQModifier(Modifier):
                 del orig_layer_weights
 
         for v in self._parent_args_cache.values():
-            v.batch_intermediates.clear()
+            v.clear()
         self._assert_all_activations_consumed()
 
     @torch.no_grad()
     def _run_samples(self, module: Module) -> list[torch.Tensor]:
         cache = self._parent_args_cache[module]
         use_prefetch = active_session().state.sequential_prefetch
-        batch_iter = cache.iter_prefetch() if use_prefetch else cache
-        outputs = [module(**batch_kwargs) for batch_kwargs in batch_iter]
-        return [
-            # If tuple, assume that first argument is the input
-            output[0] if isinstance(output, tuple) else output
-            for output in outputs
-        ]
+        batch_iter = cache.iter_prefetch() if use_prefetch else cache.iter()
+        outputs = []
+        for batch_proxy in batch_iter:
+            output = module(**batch_proxy.unwrap())
+            outputs.append(output[0] if isinstance(output, tuple) else output)
+        return outputs
 
     def _compute_best_scale(
         self,
