@@ -11,24 +11,6 @@ from torch.utils._python_dispatch import TorchDispatchMode
 from tqdm import tqdm
 
 
-class OverrideEqMode(TorchDispatchMode):
-    """
-    When using a torch.Tensor as a key in a dictionary, the equality
-    check must return a single value instead of a torch.Tensor
-    of bool values.
-    """
-
-    def __torch_dispatch__(self, func, _types, args=(), kwargs=None):
-        kwargs = kwargs or {}
-        if func is torch.ops.aten.eq.Tensor:
-            assert len(args) == 2, "Exactly 2 args must be provided"
-            return torch.tensor(id(args[0]) == id(args[1]))
-        return func(*args, **kwargs)
-
-
-offload_values: WeakKeyDictionary[torch.Tensor, torch.Tensor] = WeakKeyDictionary()
-
-
 class IntermediatesCache:
     """
     Transparent proxy for automatic tensor offloading/onloading.
@@ -55,6 +37,8 @@ class IntermediatesCache:
         cache.append(gpu_tensor)  # Auto-offloads
     """
 
+    offload_values: WeakKeyDictionary[torch.Tensor, torch.Tensor] = WeakKeyDictionary()
+
     def __init__(
         self,
         data: Any = None,
@@ -79,8 +63,8 @@ class IntermediatesCache:
         match value:
             case torch.Tensor():
                 with OverrideEqMode():
-                    if value in offload_values:
-                        offloaded = offload_values[value]
+                    if value in cls.offload_values:
+                        offloaded = cls.offload_values[value]
                     else:
                         offloaded = value.to(device=offload_device)
                         if offloaded is not value:
@@ -90,7 +74,7 @@ class IntermediatesCache:
                                 and not offloaded.is_pinned()
                             ):
                                 offloaded = offloaded.pin_memory()
-                            offload_values[value] = offloaded
+                            cls.offload_values[value] = offloaded
                 return offloaded
             case list():
                 return [cls._offload_value(v, offload_device, onload_device) for v in value]
@@ -199,49 +183,17 @@ class IntermediatesCache:
     def offload(self):
         """Offload all tensors to offload_device."""
         self._is_offloaded = True
-        
-        if isinstance(self._data, torch.Tensor):
-            new_tensor = self._offload_value(self._data, self._offload_device, self._onload_device)
-            self._data = new_tensor
-            if self._parent is not None:
-                self._parent._data[self._key] = new_tensor
-        elif isinstance(self._data, (list, dict)):
-            keys = range(len(self._data)) if isinstance(self._data, list) else list(self._data.keys())
-            for k in keys:
-                self[k].offload()
-        elif isinstance(self._data, tuple):
-            new_list = [self._offload_value(v, self._offload_device, self._onload_device) for v in self._data]
-            self._data = tuple(new_list)
-            if self._parent is not None:
-                self._parent._data[self._key] = self._data
-        elif is_dataclass(self._data):
-            for field in fields(self._data):
-                v = getattr(self._data, field.name)
-                setattr(self._data, field.name, self._offload_value(v, self._offload_device, self._onload_device))
+        self._data = self._offload_value(self._data, self._offload_device, self._onload_device)
+        if self._parent is not None:
+            self._parent._data[self._key] = self._data
 
     def onload(self, device=None):
         """Onload all tensors to target device."""
         target_device = device or self._onload_device
         self._is_offloaded = False
-        
-        if isinstance(self._data, torch.Tensor):
-            new_tensor = self._onload_value(self._data, target_device)
-            self._data = new_tensor
-            if self._parent is not None:
-                self._parent._data[self._key] = new_tensor
-        elif isinstance(self._data, (list, dict)):
-            keys = range(len(self._data)) if isinstance(self._data, list) else list(self._data.keys())
-            for k in keys:
-                self[k].onload(device)
-        elif isinstance(self._data, tuple):
-            new_list = [self._onload_value(v, target_device) for v in self._data]
-            self._data = tuple(new_list)
-            if self._parent is not None:
-                self._parent._data[self._key] = self._data
-        elif is_dataclass(self._data):
-            for field in fields(self._data):
-                v = getattr(self._data, field.name)
-                setattr(self._data, field.name, self._onload_value(v, target_device))
+        self._data = self._onload_value(self._data, target_device)
+        if self._parent is not None:
+            self._parent._data[self._key] = self._data
 
     @classmethod
     def from_dataloader(
@@ -275,15 +227,17 @@ class IntermediatesCache:
         return {k: self[k].unwrap() for k in keys if k in self._data}
 
     def iter(self) -> Generator[IntermediatesCache, None, None]:
-        """Iterate over list items, yielding each as a proxy."""
+        """Iterate over list items, yielding each as a proxy with offloaded data."""
         if not isinstance(self._data, list):
             raise TypeError("iter() only works when data is a list")
         
         for i in range(len(self._data)):
-            yield self[i]
+            proxy = self[i]
+            proxy.offload()
+            yield proxy
 
     def iter_prefetch(self) -> Generator[IntermediatesCache, None, None]:
-        """Iterate with background prefetch, yielding proxies with tensors onloaded."""
+        """Iterate with background prefetch, yielding proxies with offloaded data."""
         if not isinstance(self._data, list):
             raise TypeError("iter_prefetch() only works when data is a list")
         
@@ -291,19 +245,10 @@ class IntermediatesCache:
         if num_batches == 0:
             return
 
-        h2d_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
-
         def _fetch(batch_index):
-            event = None
             batch_proxy = self[batch_index]
-            if h2d_stream is not None:
-                with torch.cuda.stream(h2d_stream):
-                    batch_proxy.onload()
-                event = torch.cuda.Event()
-                event.record(h2d_stream)
-            else:
-                batch_proxy.onload()
-            return batch_proxy, event
+            batch_proxy.offload()
+            return batch_proxy, None
 
         with ThreadPoolExecutor(max_workers=1) as executor:
             future = None
@@ -316,6 +261,35 @@ class IntermediatesCache:
                     future = executor.submit(_fetch, batch_index + 1)
                 else:
                     future = None
-                if event is not None:
-                    torch.cuda.current_stream().wait_event(event)
                 yield current
+
+
+class OverrideEqMode(TorchDispatchMode):
+    """
+    When using a torch.Tensor as a key in a dictionary, the equality
+    check must return a single value instead of a torch.Tensor
+    of bool values.
+    Use this override context for such cases, to swap out the torch.eq
+    equality check for a check on id
+    >>> a = torch.tensor([1,2,3])
+    >>> b = torch.tensor([1,2,3])
+    >>> a == b
+    tensor([True, True, True])
+    >>> with OverrideEqMode():
+    ...     a == b
+    tensor(True)
+    """
+
+    def __torch_dispatch__(self, func, _types, args=(), kwargs=None):
+        kwargs = kwargs or {}
+
+        # Check if the operation is equality
+        if func is torch.ops.aten.eq.Tensor:
+            # Override to use torch.equal
+            assert len(args) == 2, "Exactly 2 args must be provided"
+
+            # NOTE: Errors out without cast to torch.tensor
+            return torch.tensor(id(args[0]) == id(args[1]))
+
+        # For all other operations, just run them normally
+        return func(*args, **kwargs)
